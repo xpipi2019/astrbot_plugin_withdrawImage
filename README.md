@@ -3,7 +3,7 @@
 <div align="center">
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange.svg?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
-[![版本](https://img.shields.io/badge/版本-v1.0.2-brightgreen.svg?style=flat-square)](#)
+[![版本](https://img.shields.io/badge/版本-v1.0.3-brightgreen.svg?style=flat-square)](#)
 [![状态](https://img.shields.io/badge/状态-可用-success.svg?style=flat-square)](#)
 
 *一款轻量化的，具有在群聊中按规则自动撤回指定图片或 QQ 表情（Face）的Astrbot插件，支持分群独立管理与持久化存储。*
@@ -38,12 +38,14 @@
 ## ✨ 特性
 
 - 🧩 **分群独立规则**：每个群有自己的屏蔽列表，互不影响
-- 🖼️ **图片子串匹配**：匹配 `file` / `url` / `file_unique`（不区分大小写）
+- 🖼️ **图片 file 优先匹配**：优先以 `file` 精确命中，同时保留 `url` / `file_unique` 子串匹配
 - 😀 **表情 ID 屏蔽**：按 QQ Face `id` 精确命中
 - 💬 **引用自动入库**：引用带图消息后可一键提取规则
 - 🧱 **SQLite 持久化**：规则自动落盘，重启不丢
 - 🔐 **权限控制**：仅群主/群管理员/AstrBot 超级用户可管理
-- ⚙️ **预览开关**：支持控制 `list` 是否发送预览消息
+- ⚙️ **预览可控**：支持开关与预览条数上限，避免刷屏
+- 🛡️ **失败策略可配**：撤回失败时可配置是否继续阻断后续事件
+- ⚡ **高频路径优化**：按群规则缓存 + 规则预归一化，降低每条消息查库成本
 
 ## 🚀 快速开始
 
@@ -66,7 +68,7 @@
 | 命令 | 说明 | 示例 |
 |------|------|------|
 | `face <id>` | 添加 QQ 表情 ID 屏蔽规则 | `/imgblk face 177` |
-| `img <片段>` | 添加图片匹配规则（子串匹配） | `/imgblk img image.example.com/abc` |
+| `img <片段>` | 添加图片匹配规则（推荐使用图片 `file`） | `/imgblk img 1696F9AD47BA21CF3501120D0A00C7EE.jpg` |
 | `img`（无参数） | 引用一条带图消息并自动提取规则 | 引用后发送 `/imgblk img` |
 | `list` | 查看当前群规则列表 | `/imgblk list` |
 | `del <序号>` | 按列表序号删除规则 | `/imgblk del 2` |
@@ -79,7 +81,9 @@
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |------|------|------|------|
-| `enable_list_preview` | `bool` | `true` | 是否在 `/imgblk list` 后发送表情/图片预览消息 |
+| `enable_list_preview` | `bool` | `false` | 是否在 `/imgblk list` 后发送表情/图片预览消息 |
+| `max_list_preview_items` | `int` | `10` | `/imgblk list` 预览最多发送多少条，`0` 表示不发送预览 |
+| `stop_on_recall_failure` | `bool` | `false` | 撤回失败时是否仍 `stop_event` 阻断后续处理 |
 
 ## 🧭 兼容平台
 
@@ -98,9 +102,11 @@ astrbot_plugin_withdrawImage/
 ## 💾 数据存储
 
 - 使用 SQLite 存储规则
-- 数据文件位于 AstrBot `plugin_data` 目录对应插件子目录中
+- 数据目录通过 `StarTools.get_data_dir()` 获取（遵循 AstrBot 框架约定）
 
 ## 🔗 相关链接
 
 - 插件仓库：[astrbot_plugin_withdrawImage](https://github.com/xpipi2019/astrbot_plugin_withdrawImage)
 - AstrBot 仓库：[AstrBot](https://github.com/AstrBotDevs/AstrBot)
+
+***LOVE FROM ♥️ XPIPI***

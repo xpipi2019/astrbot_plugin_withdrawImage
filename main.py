@@ -15,8 +15,7 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Face, Image, Reply
-from astrbot.api.star import Context, Star
-from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+from astrbot.api.star import Context, Star, StarTools
 
 
 class WithdrawImagePlugin(Star):
@@ -49,9 +48,21 @@ class WithdrawImagePlugin(Star):
         self._db_lock = asyncio.Lock()
         self._db_path: str | None = None
         self.config = config or {}
+        self._group_rule_cache: dict[str, tuple[list[int], list[str]]] = {}
 
     def _preview_enabled(self) -> bool:
         return bool(self.config.get("enable_list_preview", True))
+
+    def _preview_limit(self) -> int:
+        val = self.config.get("max_list_preview_items", 10)
+        try:
+            num = int(val)
+        except (TypeError, ValueError):
+            num = 10
+        return max(0, num)
+
+    def _stop_on_recall_failure(self) -> bool:
+        return bool(self.config.get("stop_on_recall_failure", False))
 
     async def _set_preview_enabled(self, enabled: bool) -> None:
         self.config["enable_list_preview"] = enabled
@@ -87,6 +98,7 @@ class WithdrawImagePlugin(Star):
         """处理 /imgblk img 的手动参数添加分支。"""
         rule = self._normalize_image_rule(manual_pattern)
         added = await self._add_rule(gid, "image", rule)
+        self._invalidate_group_cache(gid)
         n = len(await self._list_rules(gid))
         if added:
             return f"本群已添加图片匹配规则：{rule}，当前共 {n} 条。"
@@ -123,6 +135,7 @@ class WithdrawImagePlugin(Star):
                 added_n += 1
             else:
                 dup_n += 1
+        self._invalidate_group_cache(gid)
         n = len(await self._list_rules(gid))
         if added_n and dup_n:
             return f"本群已从引用消息添加 {added_n} 条规则，{dup_n} 条已存在；当前共 {n} 条。"
@@ -131,34 +144,35 @@ class WithdrawImagePlugin(Star):
         return f"引用中的图片规则均已存在，当前共 {n} 条。"
 
     async def initialize(self) -> None:
-        base = get_astrbot_plugin_data_path()
-        safe_name = (getattr(self, "name", None) or "withdraw_image").replace("/", "_")
-        sub = os.path.join(base, safe_name)
-        os.makedirs(sub, exist_ok=True)
-        self._db_path = os.path.join(sub, self._DB_NAME)
-        await self._run_db(self._init_schema_sync)
+        data_dir = StarTools.get_data_dir()
+        os.makedirs(data_dir, exist_ok=True)
+        self._db_path = str(data_dir / self._DB_NAME)
+        await self._run_db_write(self._init_schema_sync)
+        self._group_rule_cache.clear()
         logger.info("withdraw_image: SQLite 已就绪: %s", self._db_path)
 
     async def terminate(self) -> None:
+        self._group_rule_cache.clear()
         self._db_path = None
 
-    async def _run_db(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
-        """在锁内于线程中执行同步 SQLite 操作。"""
+    async def _run_db_read(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        """读操作：不加全局锁，提升并发吞吐。"""
         path = self._db_path
         if not path:
             raise RuntimeError("withdraw_image: 数据库路径未初始化")
+        def _work() -> Any:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            try:
+                return fn(conn)
+            finally:
+                conn.close()
+        return await asyncio.to_thread(_work)
 
+    async def _run_db_write(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
+        """写操作：串行化，避免 SQLite 写竞争。"""
         async with self._db_lock:
-
-            def _work() -> Any:
-                conn = sqlite3.connect(path)
-                conn.row_factory = sqlite3.Row
-                try:
-                    return fn(conn)
-                finally:
-                    conn.close()
-
-            return await asyncio.to_thread(_work)
+            return await self._run_db_read(fn)
 
     def _init_schema_sync(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -188,7 +202,7 @@ class WithdrawImagePlugin(Star):
                 {"id": r["id"], "kind": r["kind"], "value": r["value"]} for r in rows
             ]
 
-        return await self._run_db(_q)
+        return await self._run_db_read(_q)
 
     async def _add_rule(self, group_id: str, kind: str, value: str) -> bool:
         """返回 True 表示新插入一行，False 表示已存在（UNIQUE）。"""
@@ -201,7 +215,7 @@ class WithdrawImagePlugin(Star):
             conn.commit()
             return cur.rowcount > 0
 
-        return await self._run_db(_ins)
+        return await self._run_db_write(_ins)
 
     async def _delete_rule_by_index(
         self, group_id: str, index_1: int
@@ -226,14 +240,14 @@ class WithdrawImagePlugin(Star):
                 return {"id": target}
             return None
 
-        return await self._run_db(_del)
+        return await self._run_db_write(_del)
 
     async def _clear_group(self, group_id: str) -> None:
         def _clr(conn: sqlite3.Connection) -> None:
             conn.execute("DELETE FROM block_rules WHERE group_id = ?", (group_id,))
             conn.commit()
 
-        await self._run_db(_clr)
+        await self._run_db_write(_clr)
 
     @staticmethod
     def _split_face_image(entries: list[dict[str, Any]]):
@@ -252,6 +266,24 @@ class WithdrawImagePlugin(Star):
             elif kind == "image" and isinstance(val, str) and val.strip():
                 images.append(val.strip())
         return faces, images
+
+    @staticmethod
+    def _normalize_patterns(patterns: list[str]) -> list[str]:
+        return [p.lower().strip() for p in patterns if p and p.strip()]
+
+    async def _get_group_rules_cached(self, gid: str) -> tuple[list[int], list[str]]:
+        cached = self._group_rule_cache.get(gid)
+        if cached is not None:
+            return cached
+        entries = await self._list_rules(gid)
+        face_ids, image_patterns = self._split_face_image(entries)
+        normalized = self._normalize_patterns(image_patterns)
+        cached = (face_ids, normalized)
+        self._group_rule_cache[gid] = cached
+        return cached
+
+    def _invalidate_group_cache(self, gid: str) -> None:
+        self._group_rule_cache.pop(gid, None)
 
     @staticmethod
     def _normalize_image_rule(value: str) -> str:
@@ -452,14 +484,14 @@ class WithdrawImagePlugin(Star):
         gid = event.get_group_id()
         if not gid:
             return
-        entries = await self._list_rules(gid)
-        face_ids, image_patterns = self._split_face_image(entries)
+        face_ids, image_patterns = await self._get_group_rules_cached(gid)
         chain = event.get_messages()
         if not self._message_should_recall(chain, face_ids, image_patterns):
             return
-        await self._try_delete(event)
-        event.stop_event()
-        event.should_call_llm(False)
+        deleted = await self._try_delete(event)
+        if deleted or self._stop_on_recall_failure():
+            event.stop_event()
+            event.should_call_llm(False)
 
     @filter.command_group("imgblk")
     def imgblk(self):
@@ -479,6 +511,7 @@ class WithdrawImagePlugin(Star):
             )
             return
         added = await self._add_rule(gid, "face", str(face_id))
+        self._invalidate_group_cache(gid)
         n = len(await self._list_rules(gid))
         if added:
             yield event.plain_result(
@@ -524,7 +557,10 @@ class WithdrawImagePlugin(Star):
         yield event.plain_result("\n".join(lines))
         if not self._preview_enabled():
             return
-        for i, e in enumerate(entries, start=1):
+        max_items = self._preview_limit()
+        if max_items <= 0:
+            return
+        for i, e in enumerate(entries[:max_items], start=1):
             kind = str(e.get("kind", ""))
             val = str(e.get("value", ""))
             if kind == "face":
@@ -539,6 +575,10 @@ class WithdrawImagePlugin(Star):
                     yield event.chain_result([Image(file=val, url=val)])
                 else:
                     yield event.plain_result(f"{i}. 图片规则预览：{val}")
+        if len(entries) > max_items:
+            yield event.plain_result(
+                f"预览已截断：仅展示前 {max_items} 条，共 {len(entries)} 条。"
+            )
 
     @imgblk.command("preview")
     async def imgblk_preview(self, event: AstrMessageEvent):
@@ -586,6 +626,7 @@ class WithdrawImagePlugin(Star):
             return
         removed = await self._delete_rule_by_index(gid, idx)
         if removed:
+            self._invalidate_group_cache(gid)
             yield event.plain_result(
                 f"本群已删除第 {idx} 条，剩余 {len(await self._list_rules(gid))} 条。"
             )
@@ -600,4 +641,5 @@ class WithdrawImagePlugin(Star):
             yield event.plain_result(err or "权限校验失败。")
             return
         await self._clear_group(gid)
+        self._invalidate_group_cache(gid)
         yield event.plain_result("已清空本群屏蔽列表。")

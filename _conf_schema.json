@@ -3,6 +3,18 @@
     "type": "bool",
     "description": "是否在 /imgblk list 后发送表情/图片预览消息",
     "hint": "关闭后，list 仅显示文本规则，不额外发送预览消息。",
-    "default": true
+    "default": false
+  },
+  "max_list_preview_items": {
+    "type": "int",
+    "description": "/imgblk list 预览消息的最大条数",
+    "hint": "防止规则过多导致刷屏与限流。设为 0 表示不发送预览消息。",
+    "default": 10
+  },
+  "stop_on_recall_failure": {
+    "type": "bool",
+    "description": "撤回失败时是否仍阻断后续事件处理",
+    "hint": "关闭（默认）时，仅在撤回成功后 stop_event；开启后即使撤回失败也会阻断。",
+    "default": false
   }
 }
