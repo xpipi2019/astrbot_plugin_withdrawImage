@@ -1,7 +1,7 @@
 name: astrbot_plugin_withdraw_image
 display_name: 群聊图片表情自动撤回
-desc: 在 OneBot v11（aiocqhttp）群聊中，按屏蔽规则自动撤回指定图片或 QQ 表情（Face）。
-version: v1.0.6
+desc: 在 OneBot v11（aiocqhttp）群聊中，按屏蔽规则自动撤回指定图片、QQ 表情（Face）或 Emoji 字符。
+version: v1.1.0
 author: XPIPI
 repo: https://github.com/xpipi2019/astrbot_plugin_withdrawImage
 support_platforms:

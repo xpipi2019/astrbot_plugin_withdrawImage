@@ -3,10 +3,10 @@
 <div align="center">
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange.svg?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
-[![版本](https://img.shields.io/badge/版本-v1.0.6-brightgreen.svg?style=flat-square)](#)
+[![版本](https://img.shields.io/badge/版本-v1.1.0-brightgreen.svg?style=flat-square)](#)
 [![状态](https://img.shields.io/badge/状态-可用-success.svg?style=flat-square)](#)
 
-*一款轻量化的，具有在群聊中按规则自动撤回指定图片或 QQ 表情（Face）的Astrbot插件，支持分群独立管理与持久化存储。*
+*一款轻量化的，具有在群聊中按规则自动撤回指定图片、QQ 表情（Face）与 Emoji 字符的 AstrBot 插件，支持分群独立管理与持久化存储。*
 
 </div>
 
@@ -29,7 +29,7 @@
 ## 📝 简介
 
 你是否苦恼于群友发送令人不适的图片或表情包，使用本插件可以帮助你！
-本插件用于 AstrBot 群聊场景：当消息中出现被屏蔽的图片或 QQ 表情时，自动执行撤回。  
+本插件用于 AstrBot 群聊场景：当消息中出现被屏蔽的图片、QQ 表情或 Emoji 字符时，自动执行撤回。  
 规则按群独立维护，使用 SQLite 持久化，重启后不会丢失。
 
 > 💡 适合用于群聊内容治理、表情管控和图片过滤等场景。
@@ -39,7 +39,10 @@
 - 🧩 **分群独立规则**：每个群有自己的屏蔽列表，互不影响
 - 🖼️ **图片 file 优先匹配**：优先以 `file` 精确命中，同时保留 `url` / `file_unique` 子串匹配
 - 😀 **表情 ID 屏蔽**：按 QQ Face `id` 精确命中
-- 💬 **引用自动入库**：引用带图消息后可一键提取规则
+- 😄 **Emoji 字符屏蔽**：按可识别的 Emoji 字符命中（如 `😀`）
+- 💬 **引用自动入库**：`/imgblk img` 仅支持引用带图消息自动提取规则
+- 🖼️ **本地预览图落盘**：引用添加时会保存重采样预览图（最长边 < 200），`list` 时随规则一并发送
+- 🧹 **删除同步清理**：`/imgblk del` 与 `/imgblk clear` 会同步删除对应本地预览图
 - 🧱 **SQLite 持久化**：规则自动落盘，重启不丢
 - 🔐 **权限控制**：仅群主/群管理员/AstrBot 超级用户可管理
 - 📋 **列表分页展示**：`/imgblk list` 超过 10 条时，每次仅显示前 10 条
@@ -66,7 +69,7 @@
 | 命令 | 说明 | 示例 |
 |------|------|------|
 | `face <id>` | 添加 QQ 表情 ID 屏蔽规则 | `/imgblk face 177` |
-| `img <片段>` | 添加图片匹配规则（推荐使用图片 `file`） | `/imgblk img 1696F9AD47BA21CF3501120D0A00C7EE.jpg` |
+| `emoji <字符>` | 添加 Emoji 字符屏蔽规则 | `/imgblk emoji 😀` |
 | `img`（无参数） | 引用一条带图消息并自动提取规则 | 引用后发送 `/imgblk img` |
 | `list [页码]` | 查看当前群规则列表（分页） | `/imgblk list`、`/imgblk list 2` |
 | `del <序号>` | 按列表序号删除规则 | `/imgblk del 2` |
@@ -88,6 +91,7 @@ astrbot_plugin_withdrawImage/
 
 - 使用 SQLite 存储规则
 - 数据目录通过 `StarTools.get_data_dir()` 获取（遵循 AstrBot 框架约定）
+- 图片预览图保存在插件数据目录下的 `IMG_ASSET` 文件夹
 
 ## 🔗 相关链接
 

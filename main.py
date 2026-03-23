@@ -35,8 +35,8 @@ class WithdrawImagePlugin(Star):
 
     指令（需 AstrBot 管理员，且仅在群内）：/imgblk …
     - face <id>：按 QQ 表情 ID 屏蔽（与消息段 Face 的 id 一致）
-    - img <片段>：按子串匹配图片的 file / url / file_unique（不区分大小写）
-    - img（无参数）：引用回复一条带图的消息并发送 /imgblk img，从该图中自动写入规则
+    - emoji <字符>：按 Emoji 字符屏蔽（如 😀）
+    - img：引用回复一条带图的消息并发送 /imgblk img，从该图中自动写入规则
     - list：列出本群规则
     - del <序号>：按 list 序号删除
     - clear：清空本群列表
@@ -52,9 +52,13 @@ class WithdrawImagePlugin(Star):
     _IMG_ARG_RE = re.compile(
         r"^[/\s#＃!]*imgblk\s+img\s*(.*)$", re.DOTALL | re.IGNORECASE
     )
+    _EMOJI_ARG_RE = re.compile(
+        r"^[/\s#＃!]*imgblk\s+emoji\s*(.*)$", re.DOTALL | re.IGNORECASE
+    )
     _MIN_IMAGE_PATTERN_LEN = 3
     _IMG_ASSET_DIR = "IMG_ASSET"
     _MAX_PREVIEW_SIDE = 199
+    _MAX_IMAGE_DOWNLOAD_BYTES = 5 * 1024 * 1024
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -62,7 +66,7 @@ class WithdrawImagePlugin(Star):
         self._db_path: str | None = None
         self._asset_dir_path: str | None = None
         _ = config
-        self._group_rule_cache: dict[str, tuple[list[int], list[str]]] = {}
+        self._group_rule_cache: dict[str, tuple[list[int], list[str], list[str]]] = {}
 
     @staticmethod
     def _extract_subcommand_arg(raw: str, pattern: re.Pattern[str]) -> str:
@@ -85,16 +89,6 @@ class WithdrawImagePlugin(Star):
             return None, "此指令仅可在群聊中使用。"
         return gid, None
 
-    async def _add_image_rule_from_manual(self, gid: str, manual_pattern: str) -> str:
-        """处理 /imgblk img 的手动参数添加分支。"""
-        rule = self._normalize_image_rule(manual_pattern)
-        added = await self._add_rule(gid, "image", rule)
-        self._invalidate_group_cache(gid)
-        n = len(await self._list_rules(gid))
-        if added:
-            return f"本群已添加图片匹配规则：{rule}，当前共 {n} 条。"
-        return f"本群已存在相同匹配规则，当前共 {n} 条。"
-
     async def _add_image_rules_from_reply(
         self, event: AstrMessageEvent, gid: str
     ) -> str:
@@ -107,23 +101,24 @@ class WithdrawImagePlugin(Star):
         if reply_seg is None:
             return (
                 "用法：\n"
-                "1）/imgblk img <匹配片段> — 按 file/url/file_unique 子串匹配（不区分大小写）；\n"
-                "2）引用回复一条带图的消息，再发送 /imgblk img（可不带其它文字），从该图自动添加规则。"
+                "引用回复一条带图的消息，再发送 /imgblk img（可不带其它文字），从该图自动添加规则。"
             )
 
         images = await self._resolve_images_from_reply(event, reply_seg)
         if not images:
             return "未在引用消息中解析到图片。请引用包含图片的消息；若仍失败，请确认协议端支持 get_msg。"
 
-        patterns = [p for im in images if (p := self._best_pattern_from_image(im))]
-        if not patterns:
-            return "无法从图片中提取 file/url/file_unique 标识，请改用文本手动指定匹配片段。"
+        image_pattern_pairs = [
+            (im, p) for im in images if (p := self._best_pattern_from_image(im))
+        ]
+        if not image_pattern_pairs:
+            return "无法从图片中提取 file/url/file_unique 标识。"
 
         added_n = 0
         dup_n = 0
         preview_ok = 0
         setter_id = str(event.get_sender_id() or "unknown")
-        for im, p in zip(images, patterns):
+        for im, p in image_pattern_pairs:
             rule = self._normalize_image_rule(p)
             if len(rule) < self._MIN_IMAGE_PATTERN_LEN:
                 continue
@@ -409,9 +404,10 @@ class WithdrawImagePlugin(Star):
         return await self._run_db_write(_clr)
 
     @staticmethod
-    def _split_face_image(entries: list[dict[str, Any]]):
+    def _split_rules(entries: list[dict[str, Any]]):
         faces: list[int] = []
         images: list[str] = []
+        emojis: list[str] = []
         for e in entries:
             if not isinstance(e, dict):
                 continue
@@ -424,20 +420,28 @@ class WithdrawImagePlugin(Star):
                     continue
             elif kind == "image" and isinstance(val, str) and val.strip():
                 images.append(val.strip())
-        return faces, images
+            elif kind == "emoji" and isinstance(val, str) and val.strip():
+                emojis.append(val.strip())
+        return faces, images, emojis
 
     @staticmethod
     def _normalize_patterns(patterns: list[str]) -> list[str]:
         return [p.lower().strip() for p in patterns if p and p.strip()]
 
-    async def _get_group_rules_cached(self, gid: str) -> tuple[list[int], list[str]]:
+    async def _get_group_rules_cached(
+        self, gid: str
+    ) -> tuple[list[int], list[str], list[str]]:
         cached = self._group_rule_cache.get(gid)
         if cached is not None:
             return cached
         entries = await self._list_rules(gid)
-        face_ids, image_patterns = self._split_face_image(entries)
+        face_ids, image_patterns, emoji_patterns = self._split_rules(entries)
         normalized = self._normalize_patterns(image_patterns)
-        cached = (face_ids, normalized)
+        cached = (
+            face_ids,
+            normalized,
+            [e.strip() for e in emoji_patterns if e.strip()],
+        )
         self._group_rule_cache[gid] = cached
         return cached
 
@@ -486,7 +490,15 @@ class WithdrawImagePlugin(Star):
         file_field = str(getattr(img, "file", "") or "").strip()
         if file_field.startswith("base64://"):
             try:
-                return base64.b64decode(file_field[len("base64://") :], validate=False)
+                data = base64.b64decode(file_field[len("base64://") :], validate=False)
+                if len(data) > self._MAX_IMAGE_DOWNLOAD_BYTES:
+                    logger.warning(
+                        "withdraw_image: base64 图片过大，已跳过 bytes=%s limit=%s",
+                        len(data),
+                        self._MAX_IMAGE_DOWNLOAD_BYTES,
+                    )
+                    return None
+                return data
             except Exception:
                 return None
 
@@ -502,7 +514,37 @@ class WithdrawImagePlugin(Star):
                 headers={"User-Agent": "astrbot-plugin-withdraw-image/1.0"},
             )
             with urlopen(req, timeout=12) as resp:
-                return resp.read()
+                cl = resp.headers.get("Content-Length")
+                if cl:
+                    try:
+                        cl_val = int(cl)
+                        if cl_val > self._MAX_IMAGE_DOWNLOAD_BYTES:
+                            logger.warning(
+                                "withdraw_image: 图片 content-length 超限 url=%s bytes=%s limit=%s",
+                                url,
+                                cl_val,
+                                self._MAX_IMAGE_DOWNLOAD_BYTES,
+                            )
+                            return None
+                    except (TypeError, ValueError):
+                        pass
+                chunks: list[bytes] = []
+                total = 0
+                chunk_size = 64 * 1024
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > self._MAX_IMAGE_DOWNLOAD_BYTES:
+                        logger.warning(
+                            "withdraw_image: 下载图片超限中止 url=%s bytes>%s",
+                            url,
+                            self._MAX_IMAGE_DOWNLOAD_BYTES,
+                        )
+                        return None
+                    chunks.append(chunk)
+                return b"".join(chunks)
 
         try:
             return await asyncio.to_thread(_fetch)
@@ -689,14 +731,20 @@ class WithdrawImagePlugin(Star):
         chain: list,
         face_ids: list[int],
         image_patterns: list[str],
+        emoji_patterns: list[str],
     ) -> bool:
-        if not face_ids and not image_patterns:
+        if not face_ids and not image_patterns and not emoji_patterns:
             return False
         face_set = set(face_ids)
+        text_blob_parts: list[str] = []
         for comp in chain:
             if face_set and isinstance(comp, Face):
                 if comp.id in face_set:
                     return True
+            if emoji_patterns:
+                text = getattr(comp, "text", None)
+                if text:
+                    text_blob_parts.append(str(text))
             if image_patterns and isinstance(comp, Image):
                 file_name = str(getattr(comp, "file", "") or "").lower()
                 parts: list[str] = []
@@ -712,6 +760,11 @@ class WithdrawImagePlugin(Star):
                         return True
                     if p in blob:
                         return True
+        if emoji_patterns and text_blob_parts:
+            text_blob = "\n".join(text_blob_parts)
+            for e in emoji_patterns:
+                if e and e in text_blob:
+                    return True
         return False
 
     @staticmethod
@@ -732,6 +785,17 @@ class WithdrawImagePlugin(Star):
         if m:
             return int(m.group(1))
         return None
+
+    def _extract_emoji_from_event(self, event: AstrMessageEvent) -> str | None:
+        """从命令中提取 emoji 字符，支持 /imgblk emoji 😀。"""
+        raw = self._extract_subcommand_arg(
+            event.message_str, self._EMOJI_ARG_RE
+        ).strip()
+        if not raw:
+            return None
+        if raw.startswith("[") and raw.endswith("]"):
+            return None
+        return raw[:16]
 
     async def _try_delete(self, event: AstrMessageEvent) -> bool:
         if event.get_platform_name() != "aiocqhttp":
@@ -803,9 +867,13 @@ class WithdrawImagePlugin(Star):
         gid = event.get_group_id()
         if not gid:
             return
-        face_ids, image_patterns = await self._get_group_rules_cached(gid)
+        face_ids, image_patterns, emoji_patterns = await self._get_group_rules_cached(
+            gid
+        )
         chain = event.get_messages()
-        if not self._message_should_recall(chain, face_ids, image_patterns):
+        if not self._message_should_recall(
+            chain, face_ids, image_patterns, emoji_patterns
+        ):
             return
         deleted = await self._try_delete(event)
         if deleted:
@@ -835,7 +903,9 @@ class WithdrawImagePlugin(Star):
             if face_id is None:
                 yield event.chain_result(
                     [
-                        Plain("用法：/imgblk face <表情ID>，或直接发送 /imgblk face"),
+                        Plain(
+                            "用法：/imgblk face <表情ID>，或直接发送 /imgblk face \u200b"
+                        ),
                         Face(id=314),
                     ]
                 )
@@ -855,27 +925,50 @@ class WithdrawImagePlugin(Star):
             logger.warning("withdraw_image: imgblk_face 失败: %s", e)
             yield event.plain_result("操作失败，请稍后重试。")
 
-    @imgblk.command("img")
-    async def imgblk_img(self, event: AstrMessageEvent):
-        """按子串匹配图片 file/url/file_unique；或引用回复带图消息后发送 /imgblk img（无额外文字）自动入库。"""
+    @imgblk.command("emoji")
+    async def imgblk_emoji(self, event: AstrMessageEvent):
+        """添加 Emoji 字符到本群屏蔽列表。示例：/imgblk emoji 😀"""
         try:
             gid, err = await self._ensure_cmd_access(event)
             if err or not gid:
                 yield event.plain_result(err or "权限校验失败。")
                 return
-            manual_pattern = self._extract_subcommand_arg(
-                event.message_str, self._IMG_ARG_RE
-            )
-            if manual_pattern:
-                norm = self._normalize_image_rule(manual_pattern)
-                if len(norm) < self._MIN_IMAGE_PATTERN_LEN:
-                    yield event.plain_result(
-                        f"图片匹配片段过短，请至少输入 {self._MIN_IMAGE_PATTERN_LEN} 个字符。"
-                    )
-                    return
-                msg = await self._add_image_rule_from_manual(gid, manual_pattern)
+            emoji_text = self._extract_emoji_from_event(event)
+            if not emoji_text:
+                yield event.plain_result(
+                    "用法：/imgblk emoji <Emoji字符>，例如 /imgblk emoji 😀"
+                )
+                return
+            added = await self._add_rule(gid, "emoji", emoji_text)
+            self._invalidate_group_cache(gid)
+            n = len(await self._list_rules(gid))
+            if added:
+                yield event.plain_result(
+                    f"本群已添加 Emoji 屏蔽：{emoji_text}，当前共 {n} 条规则。"
+                )
             else:
-                msg = await self._add_image_rules_from_reply(event, gid)
+                yield event.plain_result(
+                    f"本群已存在相同规则（Emoji {emoji_text}），当前共 {n} 条。"
+                )
+        except Exception as e:
+            logger.warning("withdraw_image: imgblk_emoji 失败: %s", e)
+            yield event.plain_result("操作失败，请稍后重试。")
+
+    @imgblk.command("img")
+    async def imgblk_img(self, event: AstrMessageEvent):
+        """仅支持引用回复带图消息后发送 /imgblk img（无额外文字）自动入库。"""
+        try:
+            gid, err = await self._ensure_cmd_access(event)
+            if err or not gid:
+                yield event.plain_result(err or "权限校验失败。")
+                return
+            extra = self._extract_subcommand_arg(event.message_str, self._IMG_ARG_RE)
+            if extra:
+                yield event.plain_result(
+                    "`/imgblk img` 仅支持引用添加，请引用一条带图消息后再发送该命令。"
+                )
+                return
+            msg = await self._add_image_rules_from_reply(event, gid)
             yield event.plain_result(msg)
         except Exception as e:
             logger.warning("withdraw_image: imgblk_img 失败: %s", e)
@@ -935,6 +1028,8 @@ class WithdrawImagePlugin(Star):
                         )
                     except (TypeError, ValueError):
                         chain.append(Plain(f"{zwsp}\n{idx}. [QQ表情] {val}"))
+                elif kind == "emoji":
+                    chain.append(Plain(f"{zwsp}\n{idx}. [Emoji] {val}"))
                 elif kind == "image":
                     chain.append(Plain(f"{zwsp}\n{idx}. [图片] {val}"))
                     rid = int(e.get("id", 0) or 0)
