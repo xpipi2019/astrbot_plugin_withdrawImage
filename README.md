@@ -3,7 +3,7 @@
 <div align="center">
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange.svg?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
-[![版本](https://img.shields.io/badge/版本-v1.0.1-brightgreen.svg?style=flat-square)](#)
+[![版本](https://img.shields.io/badge/版本-v1.0.2-brightgreen.svg?style=flat-square)](#)
 [![状态](https://img.shields.io/badge/状态-可用-success.svg?style=flat-square)](#)
 
 *一款轻量化的，具有在群聊中按规则自动撤回指定图片或 QQ 表情（Face）的Astrbot插件，支持分群独立管理与持久化存储。*

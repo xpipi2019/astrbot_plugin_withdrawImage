@@ -11,7 +11,6 @@ import re
 import sqlite3
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -255,44 +254,18 @@ class WithdrawImagePlugin(Star):
         return faces, images
 
     @staticmethod
-    def _extract_rkey_from_text(text: str) -> str | None:
-        """从 URL 或文本中提取 rkey。支持 `...?rkey=xxx` 或 `rkey=xxx`。"""
-        raw = (text or "").strip()
-        if not raw:
-            return None
-        # URL query 解析
-        try:
-            q = parse_qs(urlparse(raw).query)
-            rks = q.get("rkey") or q.get("RKEY")
-            if rks and rks[0].strip():
-                return rks[0].strip()
-        except Exception:
-            pass
-        # 纯文本回退
-        m = re.search(r"(?:^|[?&\s])rkey=([^&\s]+)", raw, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
-        return None
-
-    @classmethod
-    def _extract_rkey_from_image(cls, img: Image) -> str | None:
-        return cls._extract_rkey_from_text(str(getattr(img, "url", "") or ""))
-
-    @classmethod
-    def _normalize_image_rule(cls, value: str) -> str:
-        """将图片规则标准化为 rkey 形式（若可提取）。"""
-        v = (value or "").strip()
-        rk = cls._extract_rkey_from_text(v)
-        if rk:
-            return f"rkey:{rk}"
-        return v
+    def _normalize_image_rule(value: str) -> str:
+        """图片规则保持原样（去首尾空白）。"""
+        return (value or "").strip()
 
     @classmethod
     def _best_pattern_from_image(cls, img: Image) -> str | None:
-        """从图片段中取用于入库匹配的字符串（优先 rkey，其次 file_unique，再次 url）。"""
-        rk = cls._extract_rkey_from_image(img)
-        if rk:
-            return f"rkey:{rk}"
+        """从图片段中取用于入库匹配的字符串（优先 file，其次 file_unique，再次 url）。"""
+        file_name = (getattr(img, "file", None) or "").strip()
+        if file_name and not file_name.startswith(
+            ("http://", "https://", "base64://", "file:///")
+        ):
+            return file_name
         fu = (getattr(img, "file_unique", None) or "").strip()
         if fu:
             return fu
@@ -373,7 +346,7 @@ class WithdrawImagePlugin(Star):
                 if comp.id in face_set:
                     return True
             if image_patterns and isinstance(comp, Image):
-                rkey = self._extract_rkey_from_image(comp)
+                file_name = str(getattr(comp, "file", "") or "").lower()
                 parts: list[str] = []
                 for attr in ("file", "url", "file_unique"):
                     v = getattr(comp, attr, None)
@@ -384,11 +357,8 @@ class WithdrawImagePlugin(Star):
                 blob = "\n".join(parts)
                 for p in image_patterns:
                     p_low = p.lower().strip()
-                    if p_low.startswith("rkey:"):
-                        expect = p_low[5:].strip()
-                        if rkey and rkey.lower() == expect:
-                            return True
-                        continue
+                    if file_name and p_low == file_name:
+                        return True
                     if p_low in blob:
                         return True
         return False
