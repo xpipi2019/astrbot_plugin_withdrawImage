@@ -477,7 +477,7 @@ class WithdrawImagePlugin(Star):
         filter.EventMessageType.GROUP_MESSAGE,
         priority=5,
     )
-    async def on_group_image(self, event: AstrMessageEvent):
+    async def on_group_image(self, event: AstrMessageEvent, *_args, **_kwargs):
         """匹配群消息中的图片 / 表情并撤回（仅本群规则）。"""
         if event.get_sender_id() and event.get_sender_id() == event.get_self_id():
             return
