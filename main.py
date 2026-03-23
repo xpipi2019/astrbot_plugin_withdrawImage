@@ -6,16 +6,26 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import os
 import re
 import sqlite3
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Face, Image, Reply
+from astrbot.api.message_components import Face, Image, Plain, Reply
 from astrbot.api.star import Context, Star, StarTools
+
+try:
+    from PIL import Image as PILImage
+except Exception:
+    PILImage = None
 
 
 class WithdrawImagePlugin(Star):
@@ -35,43 +45,24 @@ class WithdrawImagePlugin(Star):
     """
 
     _DB_NAME = "withdraw_blocklist.db"
+    _LIST_PAGE_SIZE = 10
+    _LIST_ARG_RE = re.compile(
+        r"^[/\s#＃!]*imgblk\s+list\s*(.*)$", re.DOTALL | re.IGNORECASE
+    )
     _IMG_ARG_RE = re.compile(
         r"^[/\s#＃!]*imgblk\s+img\s*(.*)$", re.DOTALL | re.IGNORECASE
     )
-    _PREVIEW_ARG_RE = re.compile(
-        r"^[/\s#＃!]*imgblk\s+preview\s*(.*)$",
-        re.DOTALL | re.IGNORECASE,
-    )
+    _MIN_IMAGE_PATTERN_LEN = 3
+    _IMG_ASSET_DIR = "IMG_ASSET"
+    _MAX_PREVIEW_SIDE = 199
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self._db_lock = asyncio.Lock()
         self._db_path: str | None = None
-        self.config = config or {}
+        self._asset_dir_path: str | None = None
+        _ = config
         self._group_rule_cache: dict[str, tuple[list[int], list[str]]] = {}
-
-    def _preview_enabled(self) -> bool:
-        return bool(self.config.get("enable_list_preview", True))
-
-    def _preview_limit(self) -> int:
-        val = self.config.get("max_list_preview_items", 10)
-        try:
-            num = int(val)
-        except (TypeError, ValueError):
-            num = 10
-        return max(0, num)
-
-    def _stop_on_recall_failure(self) -> bool:
-        return bool(self.config.get("stop_on_recall_failure", False))
-
-    async def _set_preview_enabled(self, enabled: bool) -> None:
-        self.config["enable_list_preview"] = enabled
-        save_fn = getattr(self.config, "save_config", None)
-        if callable(save_fn):
-            try:
-                save_fn()
-            except Exception as e:
-                logger.warning("withdraw_image: 保存配置失败: %s", e)
 
     @staticmethod
     def _extract_subcommand_arg(raw: str, pattern: re.Pattern[str]) -> str:
@@ -130,49 +121,123 @@ class WithdrawImagePlugin(Star):
 
         added_n = 0
         dup_n = 0
-        for p in patterns:
-            if await self._add_rule(gid, "image", p):
+        preview_ok = 0
+        setter_id = str(event.get_sender_id() or "unknown")
+        for im, p in zip(images, patterns):
+            rule = self._normalize_image_rule(p)
+            if len(rule) < self._MIN_IMAGE_PATTERN_LEN:
+                continue
+            saved = await self._save_image_asset(gid, setter_id, im)
+            if saved:
+                new_path, origin_name = saved
+                inserted, old_path = await self._upsert_image_asset_for_rule(
+                    gid, rule, new_path, origin_name, setter_id
+                )
+                if inserted:
+                    added_n += 1
+                else:
+                    dup_n += 1
+                if old_path and old_path != new_path:
+                    await self._delete_local_file(old_path)
+                preview_ok += 1
+                continue
+            if await self._add_rule(gid, "image", rule):
                 added_n += 1
             else:
                 dup_n += 1
         self._invalidate_group_cache(gid)
         n = len(await self._list_rules(gid))
         if added_n and dup_n:
-            return f"本群已从引用消息添加 {added_n} 条规则，{dup_n} 条已存在；当前共 {n} 条。"
+            return (
+                f"本群已从引用消息添加 {added_n} 条规则，{dup_n} 条已存在；"
+                f"已保存 {preview_ok} 张本地预览图；当前共 {n} 条。"
+            )
         if added_n:
-            return f"本群已从引用消息添加 {added_n} 条规则，当前共 {n} 条。"
-        return f"引用中的图片规则均已存在，当前共 {n} 条。"
+            return (
+                f"本群已从引用消息添加 {added_n} 条规则；"
+                f"已保存 {preview_ok} 张本地预览图；当前共 {n} 条。"
+            )
+        return f"引用中的图片规则均已存在；已更新/保存 {preview_ok} 张本地预览图；当前共 {n} 条。"
 
     async def initialize(self) -> None:
         data_dir = StarTools.get_data_dir()
         os.makedirs(data_dir, exist_ok=True)
         self._db_path = str(data_dir / self._DB_NAME)
+        asset_dir = data_dir / self._IMG_ASSET_DIR
+        os.makedirs(asset_dir, exist_ok=True)
+        self._asset_dir_path = str(asset_dir)
         await self._run_db_write(self._init_schema_sync)
         self._group_rule_cache.clear()
         logger.info("withdraw_image: SQLite 已就绪: %s", self._db_path)
+        if PILImage is None:
+            logger.warning(
+                "withdraw_image: 未安装 Pillow，引用图片时将无法生成本地预览图。"
+            )
 
     async def terminate(self) -> None:
         self._group_rule_cache.clear()
         self._db_path = None
+        self._asset_dir_path = None
 
     async def _run_db_read(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
         """读操作：不加全局锁，提升并发吞吐。"""
         path = self._db_path
         if not path:
             raise RuntimeError("withdraw_image: 数据库路径未初始化")
-        def _work() -> Any:
-            conn = sqlite3.connect(path)
-            conn.row_factory = sqlite3.Row
+
+        async def _run_once() -> Any:
+            def _work() -> Any:
+                conn = sqlite3.connect(path, timeout=5.0)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA busy_timeout = 5000")
+                conn.execute("PRAGMA foreign_keys = ON")
+                try:
+                    return fn(conn)
+                finally:
+                    conn.close()
+
+            return await asyncio.to_thread(_work)
+
+        retries = 3
+        for i in range(retries + 1):
             try:
-                return fn(conn)
-            finally:
-                conn.close()
-        return await asyncio.to_thread(_work)
+                return await _run_once()
+            except sqlite3.OperationalError as e:
+                if "locked" in str(e).lower() and i < retries:
+                    await asyncio.sleep(0.05 * (i + 1))
+                    continue
+                raise
 
     async def _run_db_write(self, fn: Callable[[sqlite3.Connection], Any]) -> Any:
         """写操作：串行化，避免 SQLite 写竞争。"""
         async with self._db_lock:
-            return await self._run_db_read(fn)
+            path = self._db_path
+            if not path:
+                raise RuntimeError("withdraw_image: 数据库路径未初始化")
+
+            async def _run_once() -> Any:
+                def _work() -> Any:
+                    conn = sqlite3.connect(path, timeout=5.0)
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA busy_timeout = 5000")
+                    conn.execute("PRAGMA journal_mode = WAL")
+                    conn.execute("PRAGMA foreign_keys = ON")
+                    try:
+                        return fn(conn)
+                    finally:
+                        conn.close()
+
+                return await asyncio.to_thread(_work)
+
+            retries = 3
+            for i in range(retries + 1):
+                try:
+                    return await _run_once()
+                except sqlite3.OperationalError as e:
+                    if "locked" in str(e).lower() and i < retries:
+                        await asyncio.sleep(0.05 * (i + 1))
+                        continue
+                    raise
 
     def _init_schema_sync(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -188,6 +253,21 @@ class WithdrawImagePlugin(Star):
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_block_rules_group ON block_rules(group_id)"
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rule_assets (
+                rule_id INTEGER PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                origin_name TEXT NOT NULL,
+                created_by TEXT,
+                FOREIGN KEY(rule_id) REFERENCES block_rules(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rule_assets_group ON rule_assets(group_id)"
         )
         conn.commit()
 
@@ -217,6 +297,69 @@ class WithdrawImagePlugin(Star):
 
         return await self._run_db_write(_ins)
 
+    async def _upsert_image_asset_for_rule(
+        self,
+        group_id: str,
+        value: str,
+        local_path: str,
+        origin_name: str,
+        created_by: str,
+    ) -> tuple[bool, str | None]:
+        """绑定 image 规则到预览图，返回 (是否新规则, 旧文件路径)。"""
+
+        def _upsert(conn: sqlite3.Connection) -> tuple[bool, str | None]:
+            ins = conn.execute(
+                "INSERT OR IGNORE INTO block_rules (group_id, kind, value) VALUES (?, ?, ?)",
+                (group_id, "image", value),
+            )
+            cur = conn.execute(
+                "SELECT id FROM block_rules WHERE group_id = ? AND kind = 'image' AND value = ?",
+                (group_id, value),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                raise RuntimeError("withdraw_image: 无法获取 image rule_id")
+            rule_id = int(row["id"])
+            old_cur = conn.execute(
+                "SELECT local_path FROM rule_assets WHERE rule_id = ?", (rule_id,)
+            )
+            old_row = old_cur.fetchone()
+            old_path = str(old_row["local_path"]) if old_row else None
+            conn.execute(
+                """
+                INSERT INTO rule_assets (rule_id, group_id, local_path, origin_name, created_by)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(rule_id) DO UPDATE SET
+                    group_id=excluded.group_id,
+                    local_path=excluded.local_path,
+                    origin_name=excluded.origin_name,
+                    created_by=excluded.created_by
+                """,
+                (rule_id, group_id, local_path, origin_name, created_by),
+            )
+            conn.commit()
+            return ins.rowcount > 0, old_path
+
+        return await self._run_db_write(_upsert)
+
+    async def _list_rule_assets(self, group_id: str) -> dict[int, str]:
+        def _q(conn: sqlite3.Connection) -> dict[int, str]:
+            cur = conn.execute(
+                "SELECT rule_id, local_path FROM rule_assets WHERE group_id = ?",
+                (group_id,),
+            )
+            rows = cur.fetchall()
+            out: dict[int, str] = {}
+            for r in rows:
+                try:
+                    out[int(r["rule_id"])] = str(r["local_path"])
+                except Exception:
+                    continue
+            return out
+
+        return await self._run_db_read(_q)
+
     async def _delete_rule_by_index(
         self, group_id: str, index_1: int
     ) -> dict[str, Any] | None:
@@ -224,30 +367,46 @@ class WithdrawImagePlugin(Star):
 
         def _del(conn: sqlite3.Connection) -> dict[str, Any] | None:
             cur = conn.execute(
-                "SELECT id FROM block_rules WHERE group_id = ? ORDER BY id ASC",
+                "SELECT id, kind, value FROM block_rules WHERE group_id = ? ORDER BY id ASC",
                 (group_id,),
             )
-            ids = [r[0] for r in cur.fetchall()]
-            if index_1 < 1 or index_1 > len(ids):
+            rows = cur.fetchall()
+            if index_1 < 1 or index_1 > len(rows):
                 return None
-            target = ids[index_1 - 1]
+            row = rows[index_1 - 1]
+            target = int(row["id"])
+            asset_cur = conn.execute(
+                "SELECT local_path FROM rule_assets WHERE rule_id = ?", (target,)
+            )
+            asset_row = asset_cur.fetchone()
+            local_path = str(asset_row["local_path"]) if asset_row else None
             cur = conn.execute(
                 "DELETE FROM block_rules WHERE id = ? AND group_id = ?",
                 (target, group_id),
             )
             conn.commit()
             if cur.rowcount:
-                return {"id": target}
+                return {
+                    "id": target,
+                    "kind": str(row["kind"]),
+                    "value": str(row["value"]),
+                    "local_path": local_path,
+                }
             return None
 
         return await self._run_db_write(_del)
 
-    async def _clear_group(self, group_id: str) -> None:
-        def _clr(conn: sqlite3.Connection) -> None:
+    async def _clear_group(self, group_id: str) -> list[str]:
+        def _clr(conn: sqlite3.Connection) -> list[str]:
+            cur = conn.execute(
+                "SELECT local_path FROM rule_assets WHERE group_id = ?", (group_id,)
+            )
+            paths = [str(r["local_path"]) for r in cur.fetchall()]
             conn.execute("DELETE FROM block_rules WHERE group_id = ?", (group_id,))
             conn.commit()
+            return paths
 
-        await self._run_db_write(_clr)
+        return await self._run_db_write(_clr)
 
     @staticmethod
     def _split_face_image(entries: list[dict[str, Any]]):
@@ -287,8 +446,152 @@ class WithdrawImagePlugin(Star):
 
     @staticmethod
     def _normalize_image_rule(value: str) -> str:
-        """图片规则保持原样（去首尾空白）。"""
-        return (value or "").strip()
+        """图片规则规范化（去首尾空白并转小写），用于去重与匹配一致。"""
+        return (value or "").strip().lower()
+
+    @staticmethod
+    def _safe_filename(name: str) -> str:
+        cleaned = re.sub(r'[\\/:*?"<>|\r\n]+', "_", (name or "").strip())
+        cleaned = cleaned.strip(" .")
+        return cleaned or "image"
+
+    @staticmethod
+    def _file_name_from_image(img: Image) -> str:
+        file_name = str(getattr(img, "file", "") or "").strip()
+        if file_name and not file_name.startswith("base64://"):
+            try:
+                parsed = urlparse(file_name)
+                if parsed.scheme in ("http", "https", "file"):
+                    base = os.path.basename(parsed.path)
+                else:
+                    base = os.path.basename(file_name)
+            except Exception:
+                base = os.path.basename(file_name)
+            if base:
+                return base
+        url = str(getattr(img, "url", "") or "").strip()
+        if url:
+            try:
+                base = os.path.basename(urlparse(url).path)
+                if base:
+                    return base
+            except Exception:
+                pass
+        file_unique = str(getattr(img, "file_unique", "") or "").strip()
+        if file_unique:
+            return f"{file_unique}.jpg"
+        return "image.jpg"
+
+    async def _download_image_bytes(self, img: Image) -> bytes | None:
+        file_field = str(getattr(img, "file", "") or "").strip()
+        if file_field.startswith("base64://"):
+            try:
+                return base64.b64decode(file_field[len("base64://") :], validate=False)
+            except Exception:
+                return None
+
+        url = str(getattr(img, "url", "") or "").strip()
+        if not url and file_field.startswith(("http://", "https://")):
+            url = file_field
+        if not url:
+            return None
+
+        def _fetch() -> bytes | None:
+            req = Request(
+                url=url,
+                headers={"User-Agent": "astrbot-plugin-withdraw-image/1.0"},
+            )
+            with urlopen(req, timeout=12) as resp:
+                return resp.read()
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logger.warning("withdraw_image: 下载图片失败 url=%s err=%s", url, e)
+            return None
+
+    async def _resample_preview_image(self, raw: bytes) -> tuple[bytes, str] | None:
+        pil_mod = PILImage
+        if not raw or pil_mod is None:
+            return None
+
+        def _work() -> tuple[bytes, str] | None:
+            with pil_mod.open(io.BytesIO(raw)) as im:
+                im.load()
+                w, h = im.size
+                if w <= 0 or h <= 0:
+                    return None
+                ratio = min(self._MAX_PREVIEW_SIDE / w, self._MAX_PREVIEW_SIDE / h, 1.0)
+                new_size = (max(1, int(w * ratio)), max(1, int(h * ratio)))
+                if new_size != (w, h):
+                    resampling = getattr(pil_mod, "Resampling", None)
+                    lanczos = getattr(
+                        resampling, "LANCZOS", getattr(pil_mod, "LANCZOS", 1)
+                    )
+                    im = im.resize(new_size, lanczos)
+                has_alpha = im.mode in ("RGBA", "LA") or (
+                    im.mode == "P" and "transparency" in im.info
+                )
+                buf = io.BytesIO()
+                if has_alpha:
+                    im.save(buf, format="PNG", optimize=True)
+                    return buf.getvalue(), ".png"
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                im.save(buf, format="JPEG", quality=88, optimize=True)
+                return buf.getvalue(), ".jpg"
+
+        try:
+            return await asyncio.to_thread(_work)
+        except Exception as e:
+            logger.warning("withdraw_image: 重采样失败: %s", e)
+            return None
+
+    async def _save_image_asset(
+        self, gid: str, setter_id: str, image: Image
+    ) -> tuple[str, str] | None:
+        asset_dir = self._asset_dir_path
+        if not asset_dir:
+            return None
+        raw = await self._download_image_bytes(image)
+        if not raw:
+            return None
+        sampled = await self._resample_preview_image(raw)
+        if not sampled:
+            return None
+        sampled_bytes, ext = sampled
+        src_name = self._file_name_from_image(image)
+        src_stem = Path(src_name).stem or "image"
+        safe_base = self._safe_filename(f"{gid}_{setter_id}_{src_stem}")[:120]
+        final_name = f"{safe_base}{ext}"
+        full_path = os.path.join(asset_dir, final_name)
+
+        def _write() -> None:
+            with open(full_path, "wb") as f:
+                f.write(sampled_bytes)
+
+        try:
+            await asyncio.to_thread(_write)
+            return full_path, final_name
+        except Exception as e:
+            logger.warning(
+                "withdraw_image: 写入本地预览图失败 path=%s err=%s", full_path, e
+            )
+            return None
+
+    @staticmethod
+    async def _delete_local_file(path: str | None) -> None:
+        if not path:
+            return
+
+        def _rm() -> None:
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except Exception:
+                return
+
+        await asyncio.to_thread(_rm)
 
     @classmethod
     def _best_pattern_from_image(cls, img: Image) -> str | None:
@@ -310,6 +613,23 @@ class WithdrawImagePlugin(Star):
     def _images_from_onebot_segments(segments: Any) -> list[Image]:
         """解析 OneBot get_msg 返回的 message 段列表。"""
         out: list[Image] = []
+        if isinstance(segments, str):
+            for m in re.finditer(r"\[CQ:image,([^\]]+)\]", segments):
+                payload = m.group(1)
+                fields: dict[str, str] = {}
+                for part in payload.split(","):
+                    if "=" not in part:
+                        continue
+                    k, v = part.split("=", 1)
+                    fields[k.strip()] = v.strip()
+                out.append(
+                    Image(
+                        file=fields.get("file", ""),
+                        url=fields.get("url", ""),
+                        file_unique=fields.get("file_unique", ""),
+                    )
+                )
+            return out
         if not isinstance(segments, list):
             return out
         for seg in segments:
@@ -388,10 +708,9 @@ class WithdrawImagePlugin(Star):
                     continue
                 blob = "\n".join(parts)
                 for p in image_patterns:
-                    p_low = p.lower().strip()
-                    if file_name and p_low == file_name:
+                    if file_name and p == file_name:
                         return True
-                    if p_low in blob:
+                    if p in blob:
                         return True
         return False
 
@@ -489,158 +808,192 @@ class WithdrawImagePlugin(Star):
         if not self._message_should_recall(chain, face_ids, image_patterns):
             return
         deleted = await self._try_delete(event)
-        if deleted or self._stop_on_recall_failure():
+        if deleted:
+            logger.info(
+                "withdraw_image: 命中规则并撤回成功 group_id=%s sender_id=%s message_id=%s",
+                gid,
+                event.get_sender_id(),
+                event.message_obj.message_id,
+            )
+        if deleted:
             event.stop_event()
             event.should_call_llm(False)
 
     @filter.command_group("imgblk")
-    def imgblk(self):
+    def imgblk(self, event: AstrMessageEvent):
         """管理本群图片与表情的屏蔽规则（群主/群管理员/AstrBot 超级用户可用）。"""
 
     @imgblk.command("face")
     async def imgblk_face(self, event: AstrMessageEvent):
-        """添加 QQ 表情 ID 到本群屏蔽列表。支持 /imgblk face 177 或 /imgblk face [表情:177]"""
-        gid, err = await self._ensure_cmd_access(event)
-        if err or not gid:
-            yield event.plain_result(err or "权限校验失败。")
-            return
-        face_id = self._extract_face_id_from_event(event)
-        if face_id is None:
-            yield event.plain_result(
-                "用法：/imgblk face <表情ID>，或直接发送 /imgblk face [表情:5]。"
-            )
-            return
-        added = await self._add_rule(gid, "face", str(face_id))
-        self._invalidate_group_cache(gid)
-        n = len(await self._list_rules(gid))
-        if added:
-            yield event.plain_result(
-                f"本群已添加表情屏蔽：id={face_id}，当前共 {n} 条规则。"
-            )
-        else:
-            yield event.plain_result(
-                f"本群已存在相同规则（表情 id={face_id}），当前共 {n} 条。"
-            )
+        """添加 QQ 表情 ID 到本群屏蔽列表。支持 /imgblk face 314 或 /imgblk face [表情:314]"""
+        try:
+            gid, err = await self._ensure_cmd_access(event)
+            if err or not gid:
+                yield event.plain_result(err or "权限校验失败。")
+                return
+            face_id = self._extract_face_id_from_event(event)
+            if face_id is None:
+                yield event.chain_result(
+                    [
+                        Plain("用法：/imgblk face <表情ID>，或直接发送 /imgblk face"),
+                        Face(id=314),
+                    ]
+                )
+                return
+            added = await self._add_rule(gid, "face", str(face_id))
+            self._invalidate_group_cache(gid)
+            n = len(await self._list_rules(gid))
+            if added:
+                yield event.plain_result(
+                    f"本群已添加表情屏蔽：id={face_id}，当前共 {n} 条规则。"
+                )
+            else:
+                yield event.plain_result(
+                    f"本群已存在相同规则（表情 id={face_id}），当前共 {n} 条。"
+                )
+        except Exception as e:
+            logger.warning("withdraw_image: imgblk_face 失败: %s", e)
+            yield event.plain_result("操作失败，请稍后重试。")
 
     @imgblk.command("img")
     async def imgblk_img(self, event: AstrMessageEvent):
         """按子串匹配图片 file/url/file_unique；或引用回复带图消息后发送 /imgblk img（无额外文字）自动入库。"""
-        gid, err = await self._ensure_cmd_access(event)
-        if err or not gid:
-            yield event.plain_result(err or "权限校验失败。")
-            return
-        manual_pattern = self._extract_subcommand_arg(
-            event.message_str, self._IMG_ARG_RE
-        )
-        if manual_pattern:
-            msg = await self._add_image_rule_from_manual(gid, manual_pattern)
-        else:
-            msg = await self._add_image_rules_from_reply(event, gid)
-        yield event.plain_result(msg)
+        try:
+            gid, err = await self._ensure_cmd_access(event)
+            if err or not gid:
+                yield event.plain_result(err or "权限校验失败。")
+                return
+            manual_pattern = self._extract_subcommand_arg(
+                event.message_str, self._IMG_ARG_RE
+            )
+            if manual_pattern:
+                norm = self._normalize_image_rule(manual_pattern)
+                if len(norm) < self._MIN_IMAGE_PATTERN_LEN:
+                    yield event.plain_result(
+                        f"图片匹配片段过短，请至少输入 {self._MIN_IMAGE_PATTERN_LEN} 个字符。"
+                    )
+                    return
+                msg = await self._add_image_rule_from_manual(gid, manual_pattern)
+            else:
+                msg = await self._add_image_rules_from_reply(event, gid)
+            yield event.plain_result(msg)
+        except Exception as e:
+            logger.warning("withdraw_image: imgblk_img 失败: %s", e)
+            yield event.plain_result("操作失败，请稍后重试。")
 
     @imgblk.command("list")
     async def imgblk_list(self, event: AstrMessageEvent):
         """列出本群所有屏蔽规则。"""
-        gid, err = await self._ensure_cmd_access(event)
-        if err or not gid:
-            yield event.plain_result(err or "权限校验失败。")
-            return
-        entries = await self._list_rules(gid)
-        if not entries:
-            yield event.plain_result("本群屏蔽列表为空。")
-            return
-        lines: list[str] = [f"群 {gid} 屏蔽规则："]
-        for i, e in enumerate(entries, start=1):
-            kind = str(e.get("kind", "?"))
-            kind_label = {"face": "QQ表情", "image": "图片"}.get(kind, kind)
-            val = e.get("value", "")
-            lines.append(f"{i}. [{kind_label}] {val}")
-        yield event.plain_result("\n".join(lines))
-        if not self._preview_enabled():
-            return
-        max_items = self._preview_limit()
-        if max_items <= 0:
-            return
-        for i, e in enumerate(entries[:max_items], start=1):
-            kind = str(e.get("kind", ""))
-            val = str(e.get("value", ""))
-            if kind == "face":
+        try:
+            gid, err = await self._ensure_cmd_access(event)
+            if err or not gid:
+                yield event.plain_result(err or "权限校验失败。")
+                return
+            entries = await self._list_rules(gid)
+            asset_map = await self._list_rule_assets(gid)
+            if not entries:
+                yield event.plain_result("本群屏蔽列表为空。")
+                return
+            raw_page = self._extract_subcommand_arg(
+                event.message_str, self._LIST_ARG_RE
+            )
+            if raw_page:
                 try:
-                    face_id = int(val)
-                    yield event.chain_result([Face(id=face_id)])
+                    page = int(raw_page)
                 except (TypeError, ValueError):
-                    continue
-            elif kind == "image":
-                # 优先尝试作为 URL 发送；若不是 URL，则回退为文本提示
-                if val.startswith("http://") or val.startswith("https://"):
-                    yield event.chain_result([Image(file=val, url=val)])
+                    yield event.plain_result("参数无效。用法：/imgblk list [页码]")
+                    return
+            else:
+                page = 1
+            if page < 1:
+                yield event.plain_result("页码必须 >= 1。")
+                return
+
+            total = len(entries)
+            total_pages = (total + self._LIST_PAGE_SIZE - 1) // self._LIST_PAGE_SIZE
+            if page > total_pages:
+                yield event.plain_result(f"页码超出范围。当前共 {total_pages} 页。")
+                return
+
+            start = (page - 1) * self._LIST_PAGE_SIZE
+            end = min(start + self._LIST_PAGE_SIZE, total)
+            current = entries[start:end]
+
+            zwsp = "\u200b"
+            chain = [
+                Plain(
+                    f"{zwsp}群 {gid} 屏蔽规则（第 {page}/{total_pages} 页，共 {total} 条）："
+                )
+            ]
+            for idx, e in enumerate(current, start=start + 1):
+                kind = str(e.get("kind", ""))
+                val = str(e.get("value", ""))
+                if kind == "face":
+                    try:
+                        chain.extend(
+                            [Plain(f"{zwsp}\n{idx}. [QQ表情] "), Face(id=int(val))]
+                        )
+                    except (TypeError, ValueError):
+                        chain.append(Plain(f"{zwsp}\n{idx}. [QQ表情] {val}"))
+                elif kind == "image":
+                    chain.append(Plain(f"{zwsp}\n{idx}. [图片] {val}"))
+                    rid = int(e.get("id", 0) or 0)
+                    preview_path = asset_map.get(rid)
+                    if preview_path and os.path.isfile(preview_path):
+                        chain.append(Image.fromFileSystem(preview_path))
                 else:
-                    yield event.plain_result(f"{i}. 图片规则预览：{val}")
-        if len(entries) > max_items:
-            yield event.plain_result(
-                f"预览已截断：仅展示前 {max_items} 条，共 {len(entries)} 条。"
-            )
+                    chain.append(Plain(f"{zwsp}\n{idx}. [{kind}] {val}"))
+            yield event.chain_result(chain)
 
-    @imgblk.command("preview")
-    async def imgblk_preview(self, event: AstrMessageEvent):
-        """快捷切换 list 预览开关。用法：/imgblk preview on|off"""
-        gid, err = await self._ensure_cmd_access(event)
-        if err or not gid:
-            yield event.plain_result(err or "权限校验失败。")
-            return
-
-        arg = self._extract_subcommand_arg(
-            event.message_str, self._PREVIEW_ARG_RE
-        ).lower()
-        if not arg:
-            state = "开启" if self._preview_enabled() else "关闭"
-            yield event.plain_result(
-                f"当前 list 预览：{state}\n用法：/imgblk preview on|off"
-            )
-            return
-
-        if arg in {"on", "true", "1", "开启", "开"}:
-            await self._set_preview_enabled(True)
-            yield event.plain_result("已开启 list 预览发送。")
-            return
-        if arg in {"off", "false", "0", "关闭", "关"}:
-            await self._set_preview_enabled(False)
-            yield event.plain_result("已关闭 list 预览发送。")
-            return
-        yield event.plain_result("参数无效。用法：/imgblk preview on|off")
+            if total_pages > 1:
+                yield event.plain_result("翻页用法：/imgblk list <页码>")
+        except Exception as e:
+            logger.warning("withdraw_image: imgblk_list 失败: %s", e)
+            yield event.plain_result("操作失败，请稍后重试。")
 
     @imgblk.command("del")
     async def imgblk_del(self, event: AstrMessageEvent, index: int):
         """按序号删除本群规则（序号见 /imgblk list）。"""
-        gid, err = await self._ensure_cmd_access(event)
-        if err or not gid:
-            yield event.plain_result(err or "权限校验失败。")
-            return
         try:
-            idx = int(str(index).strip())
-        except (TypeError, ValueError):
-            yield event.plain_result("参数无效。用法：/imgblk del <序号>")
-            return
-        n = len(await self._list_rules(gid))
-        if idx < 1 or idx > n:
-            yield event.plain_result(f"序号无效，本群当前共 {n} 条。")
-            return
-        removed = await self._delete_rule_by_index(gid, idx)
-        if removed:
-            self._invalidate_group_cache(gid)
-            yield event.plain_result(
-                f"本群已删除第 {idx} 条，剩余 {len(await self._list_rules(gid))} 条。"
-            )
-        else:
-            yield event.plain_result("删除失败，请重试。")
+            gid, err = await self._ensure_cmd_access(event)
+            if err or not gid:
+                yield event.plain_result(err or "权限校验失败。")
+                return
+            try:
+                idx = int(str(index).strip())
+            except (TypeError, ValueError):
+                yield event.plain_result("参数无效。用法：/imgblk del <序号>")
+                return
+            n = len(await self._list_rules(gid))
+            if idx < 1 or idx > n:
+                yield event.plain_result(f"序号无效，本群当前共 {n} 条。")
+                return
+            removed = await self._delete_rule_by_index(gid, idx)
+            if removed:
+                await self._delete_local_file(removed.get("local_path"))
+                self._invalidate_group_cache(gid)
+                yield event.plain_result(
+                    f"本群已删除第 {idx} 条，剩余 {len(await self._list_rules(gid))} 条。"
+                )
+            else:
+                yield event.plain_result("删除失败，请重试。")
+        except Exception as e:
+            logger.warning("withdraw_image: imgblk_del 失败: %s", e)
+            yield event.plain_result("操作失败，请稍后重试。")
 
     @imgblk.command("clear")
     async def imgblk_clear(self, event: AstrMessageEvent):
         """清空本群屏蔽列表。"""
-        gid, err = await self._ensure_cmd_access(event)
-        if err or not gid:
-            yield event.plain_result(err or "权限校验失败。")
-            return
-        await self._clear_group(gid)
-        self._invalidate_group_cache(gid)
-        yield event.plain_result("已清空本群屏蔽列表。")
+        try:
+            gid, err = await self._ensure_cmd_access(event)
+            if err or not gid:
+                yield event.plain_result(err or "权限校验失败。")
+                return
+            deleted_paths = await self._clear_group(gid)
+            for p in deleted_paths:
+                await self._delete_local_file(p)
+            self._invalidate_group_cache(gid)
+            yield event.plain_result("已清空本群屏蔽列表。")
+        except Exception as e:
+            logger.warning("withdraw_image: imgblk_clear 失败: %s", e)
+            yield event.plain_result("操作失败，请稍后重试。")

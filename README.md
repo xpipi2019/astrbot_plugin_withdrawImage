@@ -3,7 +3,7 @@
 <div align="center">
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-Plugin-orange.svg?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
-[![版本](https://img.shields.io/badge/版本-v1.0.4-brightgreen.svg?style=flat-square)](#)
+[![版本](https://img.shields.io/badge/版本-v1.0.6-brightgreen.svg?style=flat-square)](#)
 [![状态](https://img.shields.io/badge/状态-可用-success.svg?style=flat-square)](#)
 
 *一款轻量化的，具有在群聊中按规则自动撤回指定图片或 QQ 表情（Face）的Astrbot插件，支持分群独立管理与持久化存储。*
@@ -21,7 +21,6 @@
   <a href="#-特性">特性</a> •
   <a href="#-快速开始">快速开始</a> •
   <a href="#-命令说明">命令说明</a> •
-  <a href="#-配置项">配置项</a> •
   <a href="#-项目结构">项目结构</a>
 </p>
 
@@ -43,8 +42,7 @@
 - 💬 **引用自动入库**：引用带图消息后可一键提取规则
 - 🧱 **SQLite 持久化**：规则自动落盘，重启不丢
 - 🔐 **权限控制**：仅群主/群管理员/AstrBot 超级用户可管理
-- ⚙️ **预览可控**：支持开关与预览条数上限，避免刷屏
-- 🛡️ **失败策略可配**：撤回失败时可配置是否继续阻断后续事件
+- 📋 **列表分页展示**：`/imgblk list` 超过 10 条时，每次仅显示前 10 条
 - ⚡ **高频路径优化**：按群规则缓存 + 规则预归一化，降低每条消息查库成本
 
 ## 🚀 快速开始
@@ -70,21 +68,9 @@
 | `face <id>` | 添加 QQ 表情 ID 屏蔽规则 | `/imgblk face 177` |
 | `img <片段>` | 添加图片匹配规则（推荐使用图片 `file`） | `/imgblk img 1696F9AD47BA21CF3501120D0A00C7EE.jpg` |
 | `img`（无参数） | 引用一条带图消息并自动提取规则 | 引用后发送 `/imgblk img` |
-| `list` | 查看当前群规则列表 | `/imgblk list` |
+| `list [页码]` | 查看当前群规则列表（分页） | `/imgblk list`、`/imgblk list 2` |
 | `del <序号>` | 按列表序号删除规则 | `/imgblk del 2` |
 | `clear` | 清空当前群全部规则 | `/imgblk clear` |
-| `preview on\|off` | 开关 `list` 预览发送 | `/imgblk preview off` |
-
-## ⚙️ 配置项
-
-来自 `_conf_schema.json`：
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|------|------|------|------|
-| `enable_list_preview` | `bool` | `false` | 是否在 `/imgblk list` 后发送表情/图片预览消息 |
-| `max_list_preview_items` | `int` | `10` | `/imgblk list` 预览最多发送多少条，`0` 表示不发送预览 |
-| `stop_on_recall_failure` | `bool` | `false` | 撤回失败时是否仍 `stop_event` 阻断后续处理 |
-
 ## 🧭 兼容平台
 
 - `aiocqhttp`（OneBot v11）
@@ -95,8 +81,7 @@
 astrbot_plugin_withdrawImage/
 ├── README.md          # 项目说明文档
 ├── main.py            # 插件主逻辑（事件监听、命令处理、撤回逻辑）
-├── metadata.yaml      # 插件元数据
-└── _conf_schema.json  # 插件配置项定义
+└── metadata.yaml      # 插件元数据
 ```
 
 ## 💾 数据存储
