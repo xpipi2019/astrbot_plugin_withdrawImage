@@ -477,16 +477,8 @@ class WithdrawImagePlugin(Star):
         filter.EventMessageType.GROUP_MESSAGE,
         priority=5,
     )
-    async def on_group_image(self, *handler_args, **_kwargs):
+    async def on_group_image(self, event: AstrMessageEvent):
         """匹配群消息中的图片 / 表情并撤回（仅本群规则）。"""
-        event: AstrMessageEvent | None = None
-        for arg in handler_args:
-            if isinstance(arg, AstrMessageEvent):
-                event = arg
-                break
-        if event is None:
-            logger.warning("withdraw_image: on_group_image 未收到 AstrMessageEvent，已跳过。")
-            return
         if event.get_sender_id() and event.get_sender_id() == event.get_self_id():
             return
         gid = event.get_group_id()
@@ -559,9 +551,10 @@ class WithdrawImagePlugin(Star):
             return
         lines: list[str] = [f"群 {gid} 屏蔽规则："]
         for i, e in enumerate(entries, start=1):
-            kind = e.get("kind", "?")
+            kind = str(e.get("kind", "?"))
+            kind_label = {"face": "QQ表情", "image": "图片"}.get(kind, kind)
             val = e.get("value", "")
-            lines.append(f"{i}. [{kind}] {val}")
+            lines.append(f"{i}. [{kind_label}] {val}")
         yield event.plain_result("\n".join(lines))
         if not self._preview_enabled():
             return
