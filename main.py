@@ -11,9 +11,10 @@ import re
 import sqlite3
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from astrbot.api import logger
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Face, Image, Reply
 from astrbot.api.star import Context, Star
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
@@ -36,6 +37,13 @@ class WithdrawImagePlugin(Star):
     """
 
     _DB_NAME = "withdraw_blocklist.db"
+    _IMG_ARG_RE = re.compile(
+        r"^[/\s#＃!]*imgblk\s+img\s*(.*)$", re.DOTALL | re.IGNORECASE
+    )
+    _PREVIEW_ARG_RE = re.compile(
+        r"^[/\s#＃!]*imgblk\s+preview\s*(.*)$",
+        re.DOTALL | re.IGNORECASE,
+    )
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
@@ -54,6 +62,74 @@ class WithdrawImagePlugin(Star):
                 save_fn()
             except Exception as e:
                 logger.warning("withdraw_image: 保存配置失败: %s", e)
+
+    @staticmethod
+    def _extract_subcommand_arg(raw: str, pattern: re.Pattern[str]) -> str:
+        """从完整消息中提取子命令参数；若未匹配到命令前缀，则回退为原文本。"""
+        text = (raw or "").strip()
+        m = pattern.match(text)
+        if m:
+            return m.group(1).strip()
+        return text
+
+    async def _ensure_cmd_access(
+        self, event: AstrMessageEvent
+    ) -> tuple[str | None, str | None]:
+        """统一命令前置校验：权限 + 群聊。成功返回 (gid, None)。"""
+        ok, reason = await self._ensure_group_admin_or_owner(event)
+        if not ok:
+            return None, reason
+        gid = event.get_group_id()
+        if not gid:
+            return None, "此指令仅可在群聊中使用。"
+        return gid, None
+
+    async def _add_image_rule_from_manual(self, gid: str, manual_pattern: str) -> str:
+        """处理 /imgblk img 的手动参数添加分支。"""
+        rule = self._normalize_image_rule(manual_pattern)
+        added = await self._add_rule(gid, "image", rule)
+        n = len(await self._list_rules(gid))
+        if added:
+            return f"本群已添加图片匹配规则：{rule}，当前共 {n} 条。"
+        return f"本群已存在相同匹配规则，当前共 {n} 条。"
+
+    async def _add_image_rules_from_reply(
+        self, event: AstrMessageEvent, gid: str
+    ) -> str:
+        """处理 /imgblk img 的引用图片添加分支。"""
+        reply_seg: Reply | None = None
+        for comp in event.get_messages():
+            if isinstance(comp, Reply):
+                reply_seg = comp
+                break
+        if reply_seg is None:
+            return (
+                "用法：\n"
+                "1）/imgblk img <匹配片段> — 按 file/url/file_unique 子串匹配（不区分大小写）；\n"
+                "2）引用回复一条带图的消息，再发送 /imgblk img（可不带其它文字），从该图自动添加规则。"
+            )
+
+        images = await self._resolve_images_from_reply(event, reply_seg)
+        if not images:
+            return "未在引用消息中解析到图片。请引用包含图片的消息；若仍失败，请确认协议端支持 get_msg。"
+
+        patterns = [p for im in images if (p := self._best_pattern_from_image(im))]
+        if not patterns:
+            return "无法从图片中提取 file/url/file_unique 标识，请改用文本手动指定匹配片段。"
+
+        added_n = 0
+        dup_n = 0
+        for p in patterns:
+            if await self._add_rule(gid, "image", p):
+                added_n += 1
+            else:
+                dup_n += 1
+        n = len(await self._list_rules(gid))
+        if added_n and dup_n:
+            return f"本群已从引用消息添加 {added_n} 条规则，{dup_n} 条已存在；当前共 {n} 条。"
+        if added_n:
+            return f"本群已从引用消息添加 {added_n} 条规则，当前共 {n} 条。"
+        return f"引用中的图片规则均已存在，当前共 {n} 条。"
 
     async def initialize(self) -> None:
         base = get_astrbot_plugin_data_path()
@@ -109,7 +185,9 @@ class WithdrawImagePlugin(Star):
                 (group_id,),
             )
             rows = cur.fetchall()
-            return [{"id": r["id"], "kind": r["kind"], "value": r["value"]} for r in rows]
+            return [
+                {"id": r["id"], "kind": r["kind"], "value": r["value"]} for r in rows
+            ]
 
         return await self._run_db(_q)
 
@@ -126,7 +204,9 @@ class WithdrawImagePlugin(Star):
 
         return await self._run_db(_ins)
 
-    async def _delete_rule_by_index(self, group_id: str, index_1: int) -> dict[str, Any] | None:
+    async def _delete_rule_by_index(
+        self, group_id: str, index_1: int
+    ) -> dict[str, Any] | None:
         """按当前 list 序号删除一条；无效序号返回 None。"""
 
         def _del(conn: sqlite3.Connection) -> dict[str, Any] | None:
@@ -175,19 +255,50 @@ class WithdrawImagePlugin(Star):
         return faces, images
 
     @staticmethod
-    def _best_pattern_from_image(img: Image) -> str | None:
-        """从图片段中取用于入库匹配的字符串（优先 file_unique，其次 file，再次 url）。"""
+    def _extract_rkey_from_text(text: str) -> str | None:
+        """从 URL 或文本中提取 rkey。支持 `...?rkey=xxx` 或 `rkey=xxx`。"""
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        # URL query 解析
+        try:
+            q = parse_qs(urlparse(raw).query)
+            rks = q.get("rkey") or q.get("RKEY")
+            if rks and rks[0].strip():
+                return rks[0].strip()
+        except Exception:
+            pass
+        # 纯文本回退
+        m = re.search(r"(?:^|[?&\s])rkey=([^&\s]+)", raw, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        return None
+
+    @classmethod
+    def _extract_rkey_from_image(cls, img: Image) -> str | None:
+        return cls._extract_rkey_from_text(str(getattr(img, "url", "") or ""))
+
+    @classmethod
+    def _normalize_image_rule(cls, value: str) -> str:
+        """将图片规则标准化为 rkey 形式（若可提取）。"""
+        v = (value or "").strip()
+        rk = cls._extract_rkey_from_text(v)
+        if rk:
+            return f"rkey:{rk}"
+        return v
+
+    @classmethod
+    def _best_pattern_from_image(cls, img: Image) -> str | None:
+        """从图片段中取用于入库匹配的字符串（优先 rkey，其次 file_unique，再次 url）。"""
+        rk = cls._extract_rkey_from_image(img)
+        if rk:
+            return f"rkey:{rk}"
         fu = (getattr(img, "file_unique", None) or "").strip()
         if fu:
             return fu
-        f = (getattr(img, "file", None) or "").strip()
-        if f and not f.startswith("base64://"):
-            return f
         u = (getattr(img, "url", None) or "").strip()
         if u:
             return u
-        if f:
-            return f
         return None
 
     @staticmethod
@@ -262,6 +373,7 @@ class WithdrawImagePlugin(Star):
                 if comp.id in face_set:
                     return True
             if image_patterns and isinstance(comp, Image):
+                rkey = self._extract_rkey_from_image(comp)
                 parts: list[str] = []
                 for attr in ("file", "url", "file_unique"):
                     v = getattr(comp, attr, None)
@@ -271,7 +383,13 @@ class WithdrawImagePlugin(Star):
                     continue
                 blob = "\n".join(parts)
                 for p in image_patterns:
-                    if p.lower() in blob:
+                    p_low = p.lower().strip()
+                    if p_low.startswith("rkey:"):
+                        expect = p_low[5:].strip()
+                        if rkey and rkey.lower() == expect:
+                            return True
+                        continue
+                    if p_low in blob:
                         return True
         return False
 
@@ -320,7 +438,9 @@ class WithdrawImagePlugin(Star):
             logger.warning("withdraw_image: delete_msg 失败: %s", e)
             return False
 
-    async def _ensure_group_admin_or_owner(self, event: AstrMessageEvent) -> tuple[bool, str]:
+    async def _ensure_group_admin_or_owner(
+        self, event: AstrMessageEvent
+    ) -> tuple[bool, str]:
         """仅允许群管理员、群主或 AstrBot 超级用户操作。"""
         gid = event.get_group_id()
         if not gid:
@@ -373,18 +493,14 @@ class WithdrawImagePlugin(Star):
 
     @filter.command_group("imgblk")
     def imgblk(self):
-        """管理本群图片与表情的屏蔽规则（仅群主/群管理员可用）。"""
+        """管理本群图片与表情的屏蔽规则（群主/群管理员/AstrBot 超级用户可用）。"""
 
     @imgblk.command("face")
     async def imgblk_face(self, event: AstrMessageEvent):
         """添加 QQ 表情 ID 到本群屏蔽列表。支持 /imgblk face 177 或 /imgblk face [表情:177]"""
-        ok, reason = await self._ensure_group_admin_or_owner(event)
-        if not ok:
-            yield event.plain_result(reason)
-            return
-        gid = event.get_group_id()
-        if not gid:
-            yield event.plain_result("此指令仅可在群聊中使用。")
+        gid, err = await self._ensure_cmd_access(event)
+        if err or not gid:
+            yield event.plain_result(err or "权限校验失败。")
             return
         face_id = self._extract_face_id_from_event(event)
         if face_id is None:
@@ -395,93 +511,36 @@ class WithdrawImagePlugin(Star):
         added = await self._add_rule(gid, "face", str(face_id))
         n = len(await self._list_rules(gid))
         if added:
-            yield event.plain_result(f"本群已添加表情屏蔽：id={face_id}，当前共 {n} 条规则。")
+            yield event.plain_result(
+                f"本群已添加表情屏蔽：id={face_id}，当前共 {n} 条规则。"
+            )
         else:
-            yield event.plain_result(f"本群已存在相同规则（表情 id={face_id}），当前共 {n} 条。")
+            yield event.plain_result(
+                f"本群已存在相同规则（表情 id={face_id}），当前共 {n} 条。"
+            )
 
     @imgblk.command("img")
     async def imgblk_img(self, event: AstrMessageEvent):
         """按子串匹配图片 file/url/file_unique；或引用回复带图消息后发送 /imgblk img（无额外文字）自动入库。"""
-        ok, reason = await self._ensure_group_admin_or_owner(event)
-        if not ok:
-            yield event.plain_result(reason)
+        gid, err = await self._ensure_cmd_access(event)
+        if err or not gid:
+            yield event.plain_result(err or "权限校验失败。")
             return
-        gid = event.get_group_id()
-        if not gid:
-            yield event.plain_result("此指令仅可在群聊中使用。")
-            return
-        raw = event.message_str.strip()
-        m = re.match(r"^[/\s#＃!]*imgblk\s+img\s*(.*)$", raw, re.DOTALL | re.IGNORECASE)
-        if m:
-            manual_pattern = m.group(1).strip()
-        else:
-            manual_pattern = raw.strip()
-
+        manual_pattern = self._extract_subcommand_arg(
+            event.message_str, self._IMG_ARG_RE
+        )
         if manual_pattern:
-            added = await self._add_rule(gid, "image", manual_pattern)
-            n = len(await self._list_rules(gid))
-            if added:
-                yield event.plain_result(f"本群已添加图片匹配规则，当前共 {n} 条。")
-            else:
-                yield event.plain_result(f"本群已存在相同匹配规则，当前共 {n} 条。")
-            return
-
-        reply_seg: Reply | None = None
-        for comp in event.get_messages():
-            if isinstance(comp, Reply):
-                reply_seg = comp
-                break
-        if reply_seg is None:
-            yield event.plain_result(
-                "用法：\n"
-                "1）/imgblk img <匹配片段> — 按 file/url/file_unique 子串匹配（不区分大小写）；\n"
-                "2）引用回复一条带图的消息，再发送 /imgblk img（可不带其它文字），从该图自动添加规则。"
-            )
-            return
-
-        images = await self._resolve_images_from_reply(event, reply_seg)
-        if not images:
-            yield event.plain_result(
-                "未在引用消息中解析到图片。请引用包含图片的消息；若仍失败，请确认协议端支持 get_msg。"
-            )
-            return
-
-        patterns: list[str] = []
-        for im in images:
-            p = self._best_pattern_from_image(im)
-            if p:
-                patterns.append(p)
-        if not patterns:
-            yield event.plain_result("无法从图片中提取 file/url/file_unique 标识，请改用文本手动指定匹配片段。")
-            return
-
-        added_n = 0
-        dup_n = 0
-        for p in patterns:
-            if await self._add_rule(gid, "image", p):
-                added_n += 1
-            else:
-                dup_n += 1
-        n = len(await self._list_rules(gid))
-        if added_n and dup_n:
-            yield event.plain_result(
-                f"本群已从引用消息添加 {added_n} 条规则，{dup_n} 条已存在；当前共 {n} 条。"
-            )
-        elif added_n:
-            yield event.plain_result(f"本群已从引用消息添加 {added_n} 条规则，当前共 {n} 条。")
+            msg = await self._add_image_rule_from_manual(gid, manual_pattern)
         else:
-            yield event.plain_result(f"引用中的图片规则均已存在，当前共 {n} 条。")
+            msg = await self._add_image_rules_from_reply(event, gid)
+        yield event.plain_result(msg)
 
     @imgblk.command("list")
     async def imgblk_list(self, event: AstrMessageEvent):
         """列出本群所有屏蔽规则。"""
-        ok, reason = await self._ensure_group_admin_or_owner(event)
-        if not ok:
-            yield event.plain_result(reason)
-            return
-        gid = event.get_group_id()
-        if not gid:
-            yield event.plain_result("此指令仅可在群聊中使用。")
+        gid, err = await self._ensure_cmd_access(event)
+        if err or not gid:
+            yield event.plain_result(err or "权限校验失败。")
             return
         entries = await self._list_rules(gid)
         if not entries:
@@ -501,7 +560,7 @@ class WithdrawImagePlugin(Star):
             if kind == "face":
                 try:
                     face_id = int(val)
-                    yield event.chain_result([Face(id=face_id),])
+                    yield event.chain_result([Face(id=face_id)])
                 except (TypeError, ValueError):
                     continue
             elif kind == "image":
@@ -514,27 +573,18 @@ class WithdrawImagePlugin(Star):
     @imgblk.command("preview")
     async def imgblk_preview(self, event: AstrMessageEvent):
         """快捷切换 list 预览开关。用法：/imgblk preview on|off"""
-        ok, reason = await self._ensure_group_admin_or_owner(event)
-        if not ok:
-            yield event.plain_result(reason)
-            return
-        gid = event.get_group_id()
-        if not gid:
-            yield event.plain_result("此指令仅可在群聊中使用。")
+        gid, err = await self._ensure_cmd_access(event)
+        if err or not gid:
+            yield event.plain_result(err or "权限校验失败。")
             return
 
-        raw = event.message_str.strip()
-        m = re.match(
-            r"^[/\s#＃!]*imgblk\s+preview\s*(.*)$",
-            raw,
-            re.DOTALL | re.IGNORECASE,
-        )
-        arg = (m.group(1).strip() if m else raw).lower()
+        arg = self._extract_subcommand_arg(
+            event.message_str, self._PREVIEW_ARG_RE
+        ).lower()
         if not arg:
             state = "开启" if self._preview_enabled() else "关闭"
             yield event.plain_result(
-                f"当前 list 预览：{state}\n"
-                "用法：/imgblk preview on|off"
+                f"当前 list 预览：{state}\n用法：/imgblk preview on|off"
             )
             return
 
@@ -551,22 +601,23 @@ class WithdrawImagePlugin(Star):
     @imgblk.command("del")
     async def imgblk_del(self, event: AstrMessageEvent, index: int):
         """按序号删除本群规则（序号见 /imgblk list）。"""
-        ok, reason = await self._ensure_group_admin_or_owner(event)
-        if not ok:
-            yield event.plain_result(reason)
+        gid, err = await self._ensure_cmd_access(event)
+        if err or not gid:
+            yield event.plain_result(err or "权限校验失败。")
             return
-        gid = event.get_group_id()
-        if not gid:
-            yield event.plain_result("此指令仅可在群聊中使用。")
+        try:
+            idx = int(str(index).strip())
+        except (TypeError, ValueError):
+            yield event.plain_result("参数无效。用法：/imgblk del <序号>")
             return
         n = len(await self._list_rules(gid))
-        if index < 1 or index > n:
+        if idx < 1 or idx > n:
             yield event.plain_result(f"序号无效，本群当前共 {n} 条。")
             return
-        removed = await self._delete_rule_by_index(gid, index)
+        removed = await self._delete_rule_by_index(gid, idx)
         if removed:
             yield event.plain_result(
-                f"本群已删除第 {index} 条，剩余 {len(await self._list_rules(gid))} 条。"
+                f"本群已删除第 {idx} 条，剩余 {len(await self._list_rules(gid))} 条。"
             )
         else:
             yield event.plain_result("删除失败，请重试。")
@@ -574,13 +625,9 @@ class WithdrawImagePlugin(Star):
     @imgblk.command("clear")
     async def imgblk_clear(self, event: AstrMessageEvent):
         """清空本群屏蔽列表。"""
-        ok, reason = await self._ensure_group_admin_or_owner(event)
-        if not ok:
-            yield event.plain_result(reason)
-            return
-        gid = event.get_group_id()
-        if not gid:
-            yield event.plain_result("此指令仅可在群聊中使用。")
+        gid, err = await self._ensure_cmd_access(event)
+        if err or not gid:
+            yield event.plain_result(err or "权限校验失败。")
             return
         await self._clear_group(gid)
         yield event.plain_result("已清空本群屏蔽列表。")
